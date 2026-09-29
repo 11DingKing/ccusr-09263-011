@@ -61,3 +61,15 @@ class BookingImmutableError(StateError):
     """预约已不可变更（材料已发运或流程已终结）。"""
 
     code = "booking_immutable"
+
+
+class PermissionDeniedError(DomainError):
+    """当前主体无权查看或操作该资源。"""
+
+    code = "permission_denied"
+
+
+class CaseClosedError(StateError):
+    """争议案件已关闭：仅可查看，追加内容须经授权。"""
+
+    code = "case_closed"

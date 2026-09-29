@@ -9,6 +9,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 from ..application.booking_service import BookingService
 from ..application.catalog_service import (
@@ -19,12 +20,15 @@ from ..application.catalog_service import (
     COLLECTION_WINDOWS,
     CatalogService,
 )
+from ..application.dispute_service import DisputeService
 from ..domain.errors import (
     BusinessRuleError,
+    CaseClosedError,
     ConflictError,
     DomainError,
     IdempotencyConflict,
     NotFoundError,
+    PermissionDeniedError,
     StateError,
     ValidationError,
 )
@@ -36,6 +40,8 @@ _ERROR_STATUS = {
     StateError.code: 409,
     ConflictError.code: 409,
     IdempotencyConflict.code: 409,
+    PermissionDeniedError.code: 403,
+    CaseClosedError.code: 409,
 }
 
 HandlerFn = Callable[[dict[str, Any], dict[str, str]], Any]
@@ -61,7 +67,7 @@ class _Router:
         return None
 
 
-def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
+def build_router(catalog: CatalogService, bookings: BookingService, disputes: DisputeService | None = None) -> _Router:
     router = _Router()
 
     def with_idempotency_key(payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
@@ -69,6 +75,13 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         if key and "idempotency_key" not in payload:
             payload = {**payload, "idempotency_key": key}
         return payload
+
+    def actor_from(headers: dict[str, str]) -> dict[str, Any]:
+        """从请求头解析操作主体：``X-Actor-Id`` 与逗号分隔的 ``X-Actor-Roles``。"""
+        actor_id = headers.get("x-actor-id", "").strip()
+        raw_roles = headers.get("x-actor-roles", "")
+        roles = [r.strip() for r in raw_roles.split(",") if r.strip()]
+        return {"actor_id": actor_id, "roles": roles}
 
     # 目录登记
     router.add("POST", "/packages", lambda body, hdr: catalog.create_package(body))
@@ -138,6 +151,42 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
     )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
+
+    # 预约争议案件（客服登记、双方陈述/证据、处理决定、按权限查询）
+    if disputes is not None:
+        router.add(
+            "POST",
+            "/disputes",
+            lambda body, hdr: disputes.open_case(actor_from(hdr), body),
+        )
+        router.add(
+            "GET",
+            "/disputes",
+            lambda body, hdr: disputes.list_cases(
+                actor_from(hdr), booking_id=hdr["__query__"].get("booking_id", [None])[0]
+            ),
+        )
+        router.add(
+            "GET",
+            "/disputes/{case_id}",
+            lambda body, hdr: disputes.get_case(actor_from(hdr), hdr["__path__"]["case_id"]),
+        )
+        router.add(
+            "POST",
+            "/disputes/{case_id}/statements",
+            lambda body, hdr: disputes.add_statement(actor_from(hdr), hdr["__path__"]["case_id"], body),
+        )
+        router.add(
+            "POST",
+            "/disputes/{case_id}/evidence",
+            lambda body, hdr: disputes.add_evidence(actor_from(hdr), hdr["__path__"]["case_id"], body),
+        )
+        router.add(
+            "POST",
+            "/disputes/{case_id}/decision",
+            lambda body, hdr: disputes.decide(actor_from(hdr), hdr["__path__"]["case_id"], body),
+        )
+
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})
     return router
 
@@ -159,7 +208,9 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _dispatch(self, method: str) -> None:
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path.rstrip("/") or "/"
+            query = parse_qs(parsed_url.query)
             matched = router.match(method, path)
             if matched is None:
                 self._send_json(404, {"error": "not_found", "message": f"no route for {method} {path}"})
@@ -176,6 +227,7 @@ def make_handler_class(router: _Router) -> type[BaseHTTPRequestHandler]:
                     body = parsed
                 headers = {k.lower(): v for k, v in self.headers.items()}
                 headers["__path__"] = path_params  # type: ignore[assignment]
+                headers["__query__"] = query  # type: ignore[assignment]
                 result = handler(body, headers)
                 status = 201 if method == "POST" and path == "/bookings" else 200
                 self._send_json(status, result)
@@ -200,9 +252,10 @@ def create_server(
     port: int,
     catalog: CatalogService,
     bookings: BookingService,
+    disputes: DisputeService | None = None,
 ) -> ThreadingHTTPServer:
     """构建线程化 HTTP 服务（守护线程，随进程退出）。"""
-    router = build_router(catalog, bookings)
+    router = build_router(catalog, bookings, disputes)
     server = ThreadingHTTPServer((host, port), make_handler_class(router))
     server.daemon_threads = True
     return server
