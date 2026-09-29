@@ -9,6 +9,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+from urllib.parse import unquote
 
 from ..application.booking_service import BookingService
 from ..application.catalog_service import (
@@ -19,12 +20,15 @@ from ..application.catalog_service import (
     COLLECTION_WINDOWS,
     CatalogService,
 )
+from ..application.dispute_service import DisputeCaseService
+from ..domain.disputes import Principal
 from ..domain.errors import (
     BusinessRuleError,
     ConflictError,
     DomainError,
     IdempotencyConflict,
     NotFoundError,
+    PermissionDeniedError,
     StateError,
     ValidationError,
 )
@@ -36,6 +40,7 @@ _ERROR_STATUS = {
     StateError.code: 409,
     ConflictError.code: 409,
     IdempotencyConflict.code: 409,
+    PermissionDeniedError.code: 403,
 }
 
 HandlerFn = Callable[[dict[str, Any], dict[str, str]], Any]
@@ -61,7 +66,7 @@ class _Router:
         return None
 
 
-def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
+def build_router(catalog: CatalogService, bookings: BookingService, disputes: DisputeCaseService) -> _Router:
     router = _Router()
 
     def with_idempotency_key(payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
@@ -69,6 +74,17 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         if key and "idempotency_key" not in payload:
             payload = {**payload, "idempotency_key": key}
         return payload
+
+    def principal_of(headers: dict[str, str]) -> Principal:
+        raw = headers.get("x-principal")
+        if not raw:
+            raise ValidationError("missing X-Principal header", details={"header": "X-Principal"})
+        # 院校名称等非 ASCII 引用以百分号编码传输，如 institution:%E5%9F%8E...
+        raw = unquote(raw)
+        try:
+            return Principal.parse(raw)
+        except ValueError as exc:
+            raise ValidationError(f"invalid X-Principal header: {exc}") from exc
 
     # 目录登记
     router.add("POST", "/packages", lambda body, hdr: catalog.create_package(body))
@@ -138,6 +154,38 @@ def build_router(catalog: CatalogService, bookings: BookingService) -> _Router:
         lambda body, hdr: bookings.cancel(hdr["__path__"]["booking_id"], with_idempotency_key(body, hdr)),
     )
     router.add("POST", "/admin/recover", lambda body, hdr: bookings.recover())
+
+    # 预约争议案件（客服立案 / 双方陈述与证据 / 仲裁决定，按 X-Principal 裁剪）
+    router.add(
+        "POST",
+        "/dispute-cases",
+        lambda body, hdr: disputes.open_case(body, principal_of(hdr)),
+    )
+    router.add(
+        "GET",
+        "/dispute-cases",
+        lambda body, hdr: disputes.list_cases(principal_of(hdr)),
+    )
+    router.add(
+        "GET",
+        "/dispute-cases/{case_id}",
+        lambda body, hdr: disputes.get_case(hdr["__path__"]["case_id"], principal_of(hdr)),
+    )
+    router.add(
+        "POST",
+        "/dispute-cases/{case_id}/statements",
+        lambda body, hdr: disputes.add_statement(hdr["__path__"]["case_id"], body, principal_of(hdr)),
+    )
+    router.add(
+        "POST",
+        "/dispute-cases/{case_id}/evidence",
+        lambda body, hdr: disputes.add_evidence(hdr["__path__"]["case_id"], body, principal_of(hdr)),
+    )
+    router.add(
+        "POST",
+        "/dispute-cases/{case_id}/decision",
+        lambda body, hdr: disputes.decide(hdr["__path__"]["case_id"], body, principal_of(hdr)),
+    )
     router.add("GET", "/health", lambda body, hdr: {"status": "ok"})
     return router
 
@@ -200,9 +248,10 @@ def create_server(
     port: int,
     catalog: CatalogService,
     bookings: BookingService,
+    disputes: DisputeCaseService,
 ) -> ThreadingHTTPServer:
     """构建线程化 HTTP 服务（守护线程，随进程退出）。"""
-    router = build_router(catalog, bookings)
+    router = build_router(catalog, bookings, disputes)
     server = ThreadingHTTPServer((host, port), make_handler_class(router))
     server.daemon_threads = True
     return server

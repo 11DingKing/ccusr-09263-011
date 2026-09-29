@@ -8,15 +8,17 @@
 service_09252_008/
 ├── domain/            # 领域模型层
 │   ├── models.py      #   课程包、导师、工坊资源、材料批次、接待窗口、预约、发运单、损耗、结算、事件
+│   ├── disputes.py    #   预约争议案件、双方陈述、案件证据、处理决定、操作者身份
 │   ├── rules.py       #   纯规则：前置培训、容量、安全等级、互斥资源、材料分配、运输周期
 │   └── errors.py      #   领域错误（接口边界据此映射 HTTP 状态码）
 ├── application/       # 应用服务层
 │   ├── ports.py       #   可替换端口：Clock / IdGenerator（测试注入手动时钟与序列 ID）
 │   ├── catalog_service.py  # 目录登记与校验
-│   └── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   ├── booking_service.py  # 预约状态机：申请/报价/锁定/改期/发运/到货/签到/结算/取消/恢复
+│   └── dispute_service.py  # 争议案件：立案/陈述/证据/决定，按权限裁剪查询
 ├── persistence/       # 持久化层
 │   ├── store.py       #   存储端口 + 内存实现（快照回滚）
-│   └── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复）
+│   └── sqlite_store.py     # SQLite 实现（BEGIN IMMEDIATE，重启可恢复；争议案件物理拆表）
 └── interfaces/
     └── http_api.py    # 接口边界：HTTP/JSON API（仅标准库）
 ```
@@ -63,9 +65,22 @@ python3 -m service_09252_008 --host 127.0.0.1 --port 8080
 | POST | `/bookings/{id}/cancel` | 取消（释放候补、按规则记损耗） |
 | POST | `/admin/recover` | 恢复超时任务 |
 | GET  | `/bookings/{id}` `/health` | 查询 |
+| POST | `/dispute-cases` | 客服把升级投诉登记为预约争议案件（需 `X-Principal: support`） |
+| GET  | `/dispute-cases` `/dispute-cases/{id}` | 案件查询（按 `X-Principal` 裁剪机密证据/内部笔录/内部理由） |
+| POST | `/dispute-cases/{id}/statements` | 双方陈述（客服可代录，`internal` 笔录仅办案组可见） |
+| POST | `/dispute-cases/{id}/evidence` | 案件证据（`confidential` 仅办案组可见；关闭后冻结） |
+| POST | `/dispute-cases/{id}/decision` | 仲裁作出处理决定并关闭案件 |
 
 幂等键经请求头 `Idempotency-Key` 或载荷字段 `idempotency_key` 传入；
 同键重放返回首次结果（`idempotent_replay: true`），同键不同载荷返回 409。
+
+争议案件接口经 `X-Principal` 请求头识别操作者：`support`（客服）、
+`arbiter`（仲裁）、`institution:<院校名>`、`mentor:<导师ID>`；非 ASCII 引用
+做百分号编码。案件必须关联原预约并留存立案快照；案件、双方陈述、案件证据、
+处理决定在 SQLite 中物理拆表（`dispute_cases` / `dispute_statements` /
+`dispute_evidence` / `dispute_decisions`）。案件关闭后仍可查看但不得追加
+未经授权的证据：无授权返回 409（`authorization_required`），非仲裁身份
+返回 403；仲裁持显式授权（载荷 `authorization.granted_by/reason`）方可补录。
 
 ## 测试
 
@@ -75,7 +90,10 @@ python3 -m unittest discover -s tests -v
 
 覆盖：主流程端到端、前置培训/容量/安全/互斥/运输周期规则、跨时区、
 幂等重放、并发锁定（内存与 SQLite 双后端）、重启后超时恢复、
-部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界。
+部分到货与在途损耗、取消释放候补与损耗记录、HTTP 接口边界，
+以及预约争议案件：关联原预约立案、双方陈述、按权限裁剪查询、
+关闭案件后追加证据被拒（内存与 SQLite 双后端，含重启后冻结）、
+仲裁授权补录。
 
 ## 编译检查
 

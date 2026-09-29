@@ -1,4 +1,9 @@
-"""SQLite 存储实现：单连接 + 可重入事务，供服务重启后恢复状态。"""
+"""SQLite 存储实现：单连接 + 可重入事务，供服务重启后恢复状态。
+
+大部分集合落在通用 ``records`` 文档表；预约争议案件按治理要求物理拆表：
+案件、双方陈述、案件证据、处理决定各自独立建表，证据与决定不与案件共表，
+关闭案件后证据行不可变（由应用层在事务内判定）。
+"""
 from __future__ import annotations
 
 import json
@@ -16,7 +21,46 @@ CREATE TABLE IF NOT EXISTS records (
     data       TEXT NOT NULL,
     PRIMARY KEY (collection, key)
 );
+
+-- 预约争议案件：案件主表
+CREATE TABLE IF NOT EXISTS dispute_cases (
+    case_id TEXT PRIMARY KEY,
+    status  TEXT NOT NULL,
+    data    TEXT NOT NULL
+);
+
+-- 双方陈述（与案件拆表）
+CREATE TABLE IF NOT EXISTS dispute_statements (
+    statement_id TEXT PRIMARY KEY,
+    case_id      TEXT NOT NULL,
+    data         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_statements_case ON dispute_statements(case_id);
+
+-- 案件证据（与案件、决定拆表；关闭后由应用层冻结追加）
+CREATE TABLE IF NOT EXISTS dispute_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    case_id     TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_evidence_case ON dispute_evidence(case_id);
+
+-- 处理决定（与案件、证据拆表）
+CREATE TABLE IF NOT EXISTS dispute_decisions (
+    decision_id TEXT PRIMARY KEY,
+    case_id     TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_decisions_case ON dispute_decisions(case_id);
 """
+
+#: 物理拆表集合 -> (表名, 主键列, 可等值过滤的列 -> 表列名)
+_PHYSICAL_TABLES: dict[str, tuple[str, str, dict[str, str]]] = {
+    "dispute_cases": ("dispute_cases", "case_id", {"status": "status"}),
+    "dispute_statements": ("dispute_statements", "statement_id", {"case_id": "case_id"}),
+    "dispute_evidence": ("dispute_evidence", "evidence_id", {"case_id": "case_id"}),
+    "dispute_decisions": ("dispute_decisions", "decision_id", {"case_id": "case_id"}),
+}
 
 
 class SQLiteStore:
@@ -65,28 +109,73 @@ class SQLiteStore:
             self._lock.release()
 
     def get(self, collection: str, key: str) -> dict[str, Any] | None:
+        physical = _PHYSICAL_TABLES.get(collection)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM records WHERE collection = ? AND key = ?", (collection, key)
-            ).fetchone()
+            if physical is not None:
+                table, key_col, _ = physical
+                row = self._conn.execute(
+                    f"SELECT data FROM {table} WHERE {key_col} = ?", (key,)
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE collection = ? AND key = ?", (collection, key)
+                ).fetchone()
         return json.loads(row["data"]) if row else None
 
     def put(self, collection: str, key: str, record: dict[str, Any]) -> None:
         payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        physical = _PHYSICAL_TABLES.get(collection)
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO records (collection, key, data) VALUES (?, ?, ?) "
-                "ON CONFLICT (collection, key) DO UPDATE SET data = excluded.data",
-                (collection, key, payload),
-            )
+            if physical is not None:
+                table, key_col, filter_cols = physical
+                extra_cols = list(filter_cols.values())
+                columns = [key_col, *extra_cols, "data"]
+                placeholders = ", ".join("?" for _ in columns)
+                extra_values = [record.get(field) for field in filter_cols]
+                updates = ", ".join(f"{col} = excluded.{col}" for col in [*extra_cols, "data"])
+                self._conn.execute(
+                    f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
+                    f"ON CONFLICT({key_col}) DO UPDATE SET {updates}",
+                    (key, *extra_values, payload),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO records (collection, key, data) VALUES (?, ?, ?) "
+                    "ON CONFLICT(collection, key) DO UPDATE SET data = excluded.data",
+                    (collection, key, payload),
+                )
 
     def delete(self, collection: str, key: str) -> None:
+        physical = _PHYSICAL_TABLES.get(collection)
         with self._lock:
-            self._conn.execute("DELETE FROM records WHERE collection = ? AND key = ?", (collection, key))
+            if physical is not None:
+                table, key_col, _ = physical
+                self._conn.execute(f"DELETE FROM {table} WHERE {key_col} = ?", (key,))
+            else:
+                self._conn.execute(
+                    "DELETE FROM records WHERE collection = ? AND key = ?", (collection, key)
+                )
 
     def query(self, collection: str, **filters: Any) -> list[dict[str, Any]]:
+        physical = _PHYSICAL_TABLES.get(collection)
         with self._lock:
-            rows = self._conn.execute("SELECT data FROM records WHERE collection = ?", (collection,)).fetchall()
+            if physical is not None:
+                table, _, filter_cols = physical
+                clauses: list[str] = []
+                values: list[Any] = []
+                for field, value in filters.items():
+                    column = filter_cols.get(field)
+                    if column is None:
+                        # 未建索引列退化为 JSON 端过滤
+                        continue
+                    clauses.append(f"{column} = ?")
+                    values.append(value)
+                where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+                rows = self._conn.execute(f"SELECT data FROM {table}{where}", values).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT data FROM records WHERE collection = ?", (collection,)
+                ).fetchall()
         records = [json.loads(row["data"]) for row in rows]
         return [r for r in records if all(r.get(field) == value for field, value in filters.items())]
 
